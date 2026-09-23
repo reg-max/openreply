@@ -1,0 +1,32 @@
+# Free replacement for the DM worker.
+#
+# This fork has no long-lived worker: /api/cron/sweep does the same work in one
+# request (attach pending next-reel campaigns, reconcile comments webhooks
+# missed, run deferred jobs that came due). This workflow calls it on a
+# schedule so the whole stack can run on free tiers.
+#
+# Setup: add two repository secrets (Settings → Secrets and variables →
+# Actions): APP_URL (e.g. https://up-reply.vercel.app) and CRON_SECRET (the
+# same value as the app's CRON_SECRET env var).
+#
+# Caveat: GitHub disables scheduled workflows in a repository with no commits
+# for 60 days, and cron timing is best-effort under load. For a tighter, more
+# reliable cadence use an external scheduler (cron-job.org and similar have
+# free plans) pointed at the same URL.
+
+name: Comment sweep
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the sweep endpoint
+        run: |
+          curl --fail --silent --show-error --max-time 120 \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.APP_URL }}/api/cron/sweep"

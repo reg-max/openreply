@@ -1,40 +1,37 @@
 /**
  * Rate Limiter — Unit Tests
  *
- * Tests the hourly private-reply cap enforcement using mocked Redis.
+ * Tests the hourly private-reply cap enforcement against a mocked Postgres
+ * key-value store (this fork runs without Redis; see lib/kv/pg-kv.ts).
  * Assertions derive from RATE_LIMIT_MAX so they survive a change to the cap.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockGet, mockEval, mockDel, mockDecr } = vi.hoisted(() => ({
-  mockGet: vi.fn(),
-  mockEval: vi.fn(),
-  mockDel: vi.fn(),
-  mockDecr: vi.fn(),
+const { mockGet, mockIncrement, mockDecrement, mockDelete } = vi.hoisted(
+  () => ({
+    mockGet: vi.fn(),
+    mockIncrement: vi.fn(),
+    mockDecrement: vi.fn(),
+    mockDelete: vi.fn(),
+  })
+);
+
+vi.mock("@/lib/kv/pg-kv", () => ({
+  kvGet: mockGet,
+  kvIncrementWithTtl: mockIncrement,
+  kvDecrement: mockDecrement,
+  kvDelete: mockDelete,
 }));
-
-vi.mock("ioredis", () => {
-  const MockRedis = vi.fn().mockImplementation(function (
-    this: Record<string, unknown>
-  ) {
-    this.get = mockGet;
-    this.eval = mockEval;
-    this.del = mockDel;
-    this.decr = mockDecr;
-    return this;
-  });
-  return { default: MockRedis };
-});
-
-vi.stubEnv("REDIS_URL", "redis://localhost:6379");
 
 import {
   checkRateLimit,
   incrementDMCounter,
   reserveDMSlot,
   releaseDMSlot,
+  resetRateLimit,
   RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -65,6 +62,14 @@ describe("checkRateLimit", () => {
     expect(result.remainingDMs).toBe(RATE_LIMIT_MAX);
   });
 
+  it("should not take a slot", async () => {
+    mockGet.mockResolvedValue("50");
+
+    await checkRateLimit("account_123");
+
+    expect(mockIncrement).not.toHaveBeenCalled();
+  });
+
   it("should deny when count reaches the limit", async () => {
     mockGet.mockResolvedValue(String(RATE_LIMIT_MAX));
 
@@ -88,25 +93,23 @@ describe("checkRateLimit", () => {
 
 describe("reserveDMSlot", () => {
   it("should atomically reserve a slot when below the hourly cap", async () => {
-    mockEval.mockResolvedValue([1, 51, 139]);
+    mockIncrement.mockResolvedValue(51);
 
     const result = await reserveDMSlot("account_123");
 
-    expect(mockEval).toHaveBeenCalledWith(
-      expect.any(String),
-      1,
+    expect(mockIncrement).toHaveBeenCalledWith(
       "rate:dm:account_123",
-      RATE_LIMIT_MAX,
-      3600
+      RATE_LIMIT_WINDOW
     );
     expect(result.allowed).toBe(true);
     expect(result.reserved).toBe(true);
     expect(result.currentCount).toBe(51);
-    expect(result.remainingDMs).toBe(139);
+    expect(result.remainingDMs).toBe(RATE_LIMIT_MAX - 51);
   });
 
-  it("should recommend requeue when the atomic reserve is denied", async () => {
-    mockEval.mockResolvedValue([0, RATE_LIMIT_MAX, 0]);
+  it("should recommend requeue when the reservation lands over the cap", async () => {
+    mockIncrement.mockResolvedValue(RATE_LIMIT_MAX + 1);
+    mockDecrement.mockResolvedValue(RATE_LIMIT_MAX);
 
     const result = await reserveDMSlot("account_123", 0);
 
@@ -116,8 +119,21 @@ describe("reserveDMSlot", () => {
     expect(result.shouldSkip).toBe(false);
   });
 
+  it("should hand the slot back when the reservation is denied", async () => {
+    mockIncrement.mockResolvedValue(RATE_LIMIT_MAX + 1);
+    mockDecrement.mockResolvedValue(RATE_LIMIT_MAX);
+
+    const result = await reserveDMSlot("account_123", 0);
+
+    // A blocked attempt must not leave the counter inflated, or the window
+    // would drift further past the cap on every retry.
+    expect(mockDecrement).toHaveBeenCalledWith("rate:dm:account_123");
+    expect(result.currentCount).toBe(RATE_LIMIT_MAX);
+  });
+
   it("should skip after max requeue attempts", async () => {
-    mockEval.mockResolvedValue(["0", String(RATE_LIMIT_MAX), "0"]);
+    mockIncrement.mockResolvedValue(RATE_LIMIT_MAX + 1);
+    mockDecrement.mockResolvedValue(RATE_LIMIT_MAX);
 
     const result = await reserveDMSlot("account_123", 3);
 
@@ -129,31 +145,38 @@ describe("reserveDMSlot", () => {
 
 describe("incrementDMCounter", () => {
   it("should use the atomic reservation path", async () => {
-    mockEval.mockResolvedValue([1, 51, 139]);
+    mockIncrement.mockResolvedValue(51);
 
     const count = await incrementDMCounter("account_123");
 
-    expect(mockEval).toHaveBeenCalled();
+    expect(mockIncrement).toHaveBeenCalled();
     expect(count).toBe(51);
   });
 });
 
 describe("releaseDMSlot", () => {
   it("hands a reserved slot back and returns the new count", async () => {
-    mockDecr.mockResolvedValue(49);
+    mockDecrement.mockResolvedValue(49);
 
     const count = await releaseDMSlot("account_123");
 
-    expect(mockDecr).toHaveBeenCalledWith("rate:dm:account_123");
+    expect(mockDecrement).toHaveBeenCalledWith("rate:dm:account_123");
     expect(count).toBe(49);
   });
 
-  it("clamps to zero and clears the key when nothing was reserved", async () => {
-    mockDecr.mockResolvedValue(-1);
+  it("reports zero when the window already rolled over", async () => {
+    mockDecrement.mockResolvedValue(0);
 
     const count = await releaseDMSlot("account_123");
 
     expect(count).toBe(0);
-    expect(mockDel).toHaveBeenCalledWith("rate:dm:account_123");
+  });
+});
+
+describe("resetRateLimit", () => {
+  it("clears the account's counter", async () => {
+    await resetRateLimit("account_123");
+
+    expect(mockDelete).toHaveBeenCalledWith("rate:dm:account_123");
   });
 });

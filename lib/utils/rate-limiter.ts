@@ -1,12 +1,13 @@
 /**
  * Rate Limiter
  *
- * Redis-based rate limiter for Instagram private replies.
+ * Postgres-backed rate limiter for Instagram private replies (this fork runs
+ * without Redis; see lib/kv/pg-kv.ts).
  *
  * The cap matches Meta's documented limit for this exact call: 750 private
  * replies per hour per Instagram professional account, for comments on posts
- * and reels. Exceeding it risks 429s and app-level restrictions, so the worker
- * requeues rather than pushing through.
+ * and reels. Exceeding it risks 429s and app-level restrictions, so the sender
+ * defers rather than pushing through.
  * https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
  *
  * Note this is a hard ceiling with no headroom. If Meta throttles before the
@@ -14,23 +15,17 @@
  * this value.
  */
 
-import Redis from "ioredis";
+import {
+  kvDecrement,
+  kvDelete,
+  kvGet,
+  kvIncrementWithTtl,
+} from "@/lib/kv/pg-kv";
 
 const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented cap
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
 const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_REQUEUE_ATTEMPTS = 3;
-
-let redis: Redis | null = null;
-
-function getRedis(): Redis {
-  if (!redis) {
-    redis = new Redis(process.env.REDIS_URL!, {
-      maxRetriesPerRequest: null, // required by BullMQ
-    });
-  }
-  return redis;
-}
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -42,33 +37,11 @@ export interface RateLimitResult {
   reserved: boolean;
 }
 
-const RESERVE_DM_SLOT_SCRIPT = `
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-local max = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
-
-if current >= max then
-  return {0, current, 0}
-end
-
-local next_count = redis.call("INCR", KEYS[1])
-if next_count == 1 then
-  redis.call("EXPIRE", KEYS[1], ttl)
-end
-
-return {1, next_count, max - next_count}
-`;
-
-function toScriptNumber(value: unknown): number {
-  if (typeof value === "number") return value;
-  if (typeof value === "string") return Number.parseInt(value, 10);
-  return 0;
+function counterKey(instagramAccountId: string): string {
+  return `rate:dm:${instagramAccountId}`;
 }
 
-function blockedResult(
-  count: number,
-  requeueAttempt: number
-): RateLimitResult {
+function blockedResult(count: number, requeueAttempt: number): RateLimitResult {
   if (requeueAttempt >= MAX_REQUEUE_ATTEMPTS) {
     return {
       allowed: false,
@@ -95,47 +68,18 @@ function blockedResult(
 /**
  * Check if an Instagram account is within its DM rate limit.
  *
- * Uses a Redis counter with a 1-hour TTL per account.
- * Key pattern: `rate:dm:{instagramAccountId}`
- *
- * @param instagramAccountId - The Instagram account ID to check
- * @param requeueAttempt - How many times this job has been requeued (0 = first attempt)
- * @returns Rate limit result with action recommendations
+ * Read-only: it reports the current window without taking a slot. Callers that
+ * are about to send must use reserveDMSlot instead.
  */
 export async function checkRateLimit(
   instagramAccountId: string,
   requeueAttempt: number = 0
 ): Promise<RateLimitResult> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-
-  const currentCount = await client.get(key);
-  const count = currentCount ? parseInt(currentCount, 10) : 0;
+  const raw = await kvGet(counterKey(instagramAccountId));
+  const count = raw ? Number.parseInt(raw, 10) : 0;
 
   if (count >= RATE_LIMIT_MAX) {
-    // Over the limit
-    if (requeueAttempt >= MAX_REQUEUE_ATTEMPTS) {
-      // Exceeded max requeue attempts — skip this DM
-      return {
-        allowed: false,
-        currentCount: count,
-        remainingDMs: 0,
-        shouldRequeue: false,
-        requeueDelayMs: 0,
-        shouldSkip: true,
-        reserved: false,
-      };
-    }
-
-    return {
-      allowed: false,
-      currentCount: count,
-      remainingDMs: 0,
-      shouldRequeue: true,
-      requeueDelayMs: REQUEUE_DELAY_MS,
-      shouldSkip: false,
-      reserved: false,
-    };
+    return blockedResult(count, requeueAttempt);
   }
 
   return {
@@ -151,36 +95,28 @@ export async function checkRateLimit(
 
 /**
  * Atomically reserve a DM send slot for an Instagram account.
- * This is the worker-safe path; it prevents concurrent jobs from all passing
- * the rate-limit check before any of them increments the Redis counter.
+ *
+ * The increment and the window's TTL are applied in one statement, so two
+ * concurrent invocations cannot both pass the check on the last free slot. When
+ * the increment lands above the cap the slot is handed straight back, so a
+ * blocked attempt does not inflate the counter.
  */
 export async function reserveDMSlot(
   instagramAccountId: string,
   requeueAttempt: number = 0
 ): Promise<RateLimitResult> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
+  const key = counterKey(instagramAccountId);
+  const count = await kvIncrementWithTtl(key, RATE_LIMIT_WINDOW);
 
-  const result = await client.eval(
-    RESERVE_DM_SLOT_SCRIPT,
-    1,
-    key,
-    RATE_LIMIT_MAX,
-    RATE_LIMIT_WINDOW
-  );
-  const values = Array.isArray(result) ? result : [];
-  const allowedFlag = toScriptNumber(values[0]);
-  const count = toScriptNumber(values[1]);
-  const remaining = toScriptNumber(values[2]);
-
-  if (allowedFlag !== 1) {
-    return blockedResult(count, requeueAttempt);
+  if (count > RATE_LIMIT_MAX) {
+    const restored = await kvDecrement(key);
+    return blockedResult(restored, requeueAttempt);
   }
 
   return {
     allowed: true,
     currentCount: count,
-    remainingDMs: remaining,
+    remainingDMs: RATE_LIMIT_MAX - count,
     shouldRequeue: false,
     requeueDelayMs: 0,
     shouldSkip: false,
@@ -192,33 +128,25 @@ export async function reserveDMSlot(
  * Release a DM slot previously taken by reserveDMSlot.
  *
  * reserveDMSlot increments the hourly counter before the send, so concurrent
- * jobs can't all pass the check at once. When that send then fails (closed
+ * sends can't all pass the check at once. When that send then fails (closed
  * messaging window, expired token, rejected reply) the reserved slot is never
  * used and must be handed back. Otherwise a comment that never delivers a DM
- * still burns one slot per attempt, and BullMQ's retries burn several. On a
- * post with many failing sends the counter inflates past the real number of
- * DMs and legitimate replies get skipped as rate-limited until the TTL expires.
+ * still burns one slot per attempt, and retries burn several. On a post with
+ * many failing sends the counter inflates past the real number of DMs and
+ * legitimate replies get skipped as rate-limited until the window expires.
  *
- * DECR is atomic and preserves the key's TTL, so the hourly window still resets
- * when it originally would. A missing key (the window already rolled over)
- * would decrement to -1 with no expiry, so that case is clamped back to zero.
+ * The decrement preserves the key's expiry, so the hourly window still resets
+ * when it originally would, and is clamped at zero.
  */
 export async function releaseDMSlot(
   instagramAccountId: string
 ): Promise<number> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-  const next = await client.decr(key);
-  if (next < 0) {
-    await client.del(key);
-    return 0;
-  }
-  return next;
+  return kvDecrement(counterKey(instagramAccountId));
 }
 
 /**
  * Backwards-compatible helper for tests and admin scripts.
- * Prefer reserveDMSlot in workers.
+ * Prefer reserveDMSlot in senders.
  */
 export async function incrementDMCounter(
   instagramAccountId: string
@@ -233,10 +161,8 @@ export async function incrementDMCounter(
 export async function getCurrentDMCount(
   instagramAccountId: string
 ): Promise<number> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-  const count = await client.get(key);
-  return count ? parseInt(count, 10) : 0;
+  const raw = await kvGet(counterKey(instagramAccountId));
+  return raw ? Number.parseInt(raw, 10) : 0;
 }
 
 /**
@@ -245,9 +171,7 @@ export async function getCurrentDMCount(
 export async function resetRateLimit(
   instagramAccountId: string
 ): Promise<void> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-  await client.del(key);
+  await kvDelete(counterKey(instagramAccountId));
 }
 
 // Export constants for use in tests

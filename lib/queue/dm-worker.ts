@@ -1,8 +1,6 @@
 import { createHash } from "node:crypto";
-import { UnrecoverableError, Worker, type Job } from "bullmq";
+import { UnrecoverableError, type Job } from "bullmq";
 import {
-  getDMQueue,
-  getRedisConnection,
   MESSAGE_JOB_NAME,
   POSTBACK_JOB_NAME,
   FOLLOWUP_JOB_NAME,
@@ -12,6 +10,7 @@ import {
   type ProcessPostbackJob,
   type ProcessFollowUpJob,
 } from "./client";
+import { enqueueJob } from "@/lib/queue/inline";
 import { prisma } from "@/lib/db/client";
 import {
   MetaApiError,
@@ -560,7 +559,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           },
         });
 
-        await getDMQueue().add(
+        await enqueueJob(
           "process-comment",
           {
             ...job.data,
@@ -967,7 +966,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
       const delayMs =
         Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000;
-      await getDMQueue().add(
+      await enqueueJob(
         FOLLOWUP_JOB_NAME,
         {
           instagramAccountId: automation.instagramAccount.instagramId,
@@ -1300,7 +1299,7 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         // here exactly as it does after a button tap. Not scheduled behind the
         // follow prompt — no link went out yet in that branch.
         if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
-          await getDMQueue().add(
+          await enqueueJob(
             FOLLOWUP_JOB_NAME,
             {
               instagramAccountId: automation.instagramAccount.instagramId,
@@ -1436,46 +1435,38 @@ async function recordWorkerFailure(
   }
 }
 
-export function createDMWorker(): Worker<DmQueueJob> {
-  const worker = new Worker<DmQueueJob>("dm-processing", processJob, {
-    connection: getRedisConnection(),
-    concurrency: 5,
-    settings: {
-      backoffStrategy: (attemptsMade: number) =>
-        BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
-    },
-  });
+/**
+ * Run one job in this process.
+ *
+ * This fork has no BullMQ worker: the webhook route and the cron sweep call
+ * here directly (through lib/queue/inline.ts). The processors only ever read
+ * `data`, `id`, `name` and `attemptsMade` off a job, so a plain object stands
+ * in for BullMQ's Job. Failures are recorded and rethrown, so the caller can
+ * schedule a retry.
+ */
+export async function runDmJobInline({
+  name,
+  data,
+  id,
+  attemptsMade = 0,
+}: {
+  name: string;
+  data: DmQueueJob;
+  id?: string;
+  attemptsMade?: number;
+}): Promise<void> {
+  const job = {
+    name,
+    data,
+    id: id ?? `${name}_${Date.now()}`,
+    attemptsMade,
+  } as unknown as Job<DmQueueJob>;
 
-  worker.on("completed", (job) => {
-    console.log(`[DM Worker] Job ${job.id} completed`);
-  });
-
-  worker.on("failed", (job, err) => {
-    console.error(
-      `[DM Worker] Job ${job?.id} failed (attempt ${job?.attemptsMade}):`,
-      err.message
-    );
-    void recordWorkerFailure(job, err);
-  });
-
-  worker.on("error", (err) => {
-    console.error("[DM Worker] Worker error:", err.message);
-    void prisma.operationalEvent
-      .create({
-        data: {
-          source: "WORKER",
-          level: "ERROR",
-          message: `DM worker process error: ${err.message}`,
-          payload: { name: err.name },
-        },
-      })
-      .catch((recordError) => {
-        console.error(
-          "[DM Worker] Failed to record worker process error:",
-          formatError(recordError)
-        );
-      });
-  });
-
-  return worker;
+  try {
+    await processJob(job);
+  } catch (error) {
+    const err = error instanceof Error ? error : new Error(String(error));
+    await recordWorkerFailure(job, err);
+    throw err;
+  }
 }

@@ -26,7 +26,7 @@
  */
 
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { enqueueJob } from "@/lib/queue/inline";
 import {
   getRecentMediaComments,
   getUserMedia,
@@ -187,7 +187,6 @@ async function sweepCampaign({
   }
   if (mediaIds.length === 0) return stat;
 
-  const queue = getDMQueue();
 
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
@@ -260,7 +259,7 @@ async function sweepCampaign({
       // drop this add, so the comment would never be retried. Dedup is handled
       // above (owner-reply + DmLog guards) and the worker is idempotent
       // (publicReplySentAt / SENT), so re-processing a comment is safe.
-      await queue.add("process-comment", {
+      await enqueueJob("process-comment", {
         instagramAccountId: account.instagramId,
         accountConnectionId: account.id,
         commentId: c.id,

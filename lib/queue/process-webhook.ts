@@ -1,5 +1,6 @@
 import { prisma } from '@/lib/db/client';
-import { getDMQueue, MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
+import { MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from '@/lib/queue/client';
+import { enqueueJob } from '@/lib/queue/inline';
 import { parseCommentEvents, parseMessageEvents, parsePostbackEvents, parseReadEvents } from '@/lib/meta/webhook';
 import { Prisma, type InstagramProvider } from '@/app/generated/prisma/client';
 
@@ -34,13 +35,12 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
     const commentEvents = parseCommentEvents(
       payload as Parameters<typeof parseCommentEvents>[0]
     );
-    const queue = getDMQueue();
 
     for (const event of commentEvents) {
       const account = accountMap.get(event.instagramAccountId);
       if (!account) continue;
 
-      await queue.add(
+      await enqueueJob(
         "process-comment",
         {
           instagramAccountId: event.instagramAccountId,
@@ -72,7 +72,7 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
     );
 
     for (const event of postbackEvents) {
-      await queue.add(
+      await enqueueJob(
         POSTBACK_JOB_NAME,
         {
           instagramAccountId: event.instagramAccountId,
@@ -100,7 +100,7 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
       const account = accountMap.get(event.instagramAccountId);
       if (!account) continue;
 
-      await queue.add(
+      await enqueueJob(
         MESSAGE_JOB_NAME,
         {
           instagramAccountId: event.instagramAccountId,
@@ -163,7 +163,7 @@ export async function processInstagramWebhook({ payload: incoming, provider, wor
         if (scheduledAutomationIds.has(automation.id)) continue;
         scheduledAutomationIds.add(automation.id);
 
-        await queue.add(
+        await enqueueJob(
           POSTBACK_JOB_NAME,
           {
             instagramAccountId: event.instagramAccountId,

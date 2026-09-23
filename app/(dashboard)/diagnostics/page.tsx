@@ -156,7 +156,7 @@ export default function DiagnosticsPage() {
               : `Last heartbeat ${workerAgeSeconds}s ago`}
           </p>
         </div>
-        {["waiting", "active", "delayed", "failed"].map((key) => (
+        {["waiting", "delayed", "retrying"].map((key) => (
           <div key={key} className="panel rounded p-4 sm:p-5">
             <p className="text-xs font-semibold uppercase text-muted">
               Queue {key}

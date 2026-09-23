@@ -110,11 +110,13 @@ vi.mock("@/lib/ops/worker-health", () => ({
   recordWorkerAlert: vi.fn(),
 }));
 
+// This fork enqueues through lib/queue/inline (no Redis), so the deferred /
+// inline hand-off is what gets asserted where BullMQ's queue.add used to be.
+vi.mock("@/lib/queue/inline", () => ({
+  enqueueJob: mockQueueAdd,
+}));
+
 vi.mock("@/lib/queue/client", () => ({
-  getDMQueue: () => ({
-    add: mockQueueAdd,
-  }),
-  getRedisConnection: vi.fn(),
   POSTBACK_JOB_NAME: "process-postback",
   FOLLOWUP_JOB_NAME: "process-followup",
   MESSAGE_JOB_NAME: "process-message",
@@ -136,7 +138,7 @@ vi.mock("bullmq", () => {
   };
 });
 
-import { createDMWorker } from "../lib/queue/dm-worker";
+import { runDmJobInline } from "../lib/queue/dm-worker";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -178,19 +180,21 @@ const mockJobData = {
   mediaId: "media_101",
 };
 
+// The worker process is gone in this fork: jobs run through runDmJobInline,
+// so the tests drive that instead of the BullMQ processor callback.
 function getProcessor(): (job: {
   name?: string;
   data: typeof mockJobData | Record<string, unknown>;
   id: string;
   attemptsMade: number;
 }) => Promise<void> {
-  createDMWorker();
-  return (global as Record<string, unknown>).__dmWorkerProcessor as (job: {
-    name?: string;
-    data: typeof mockJobData | Record<string, unknown>;
-    id: string;
-    attemptsMade: number;
-  }) => Promise<void>;
+  return (job) =>
+    runDmJobInline({
+      name: job.name ?? "process-comment",
+      data: job.data as never,
+      id: job.id,
+      attemptsMade: job.attemptsMade,
+    });
 }
 
 function createMockJob(data: Record<string, unknown> = mockJobData) {

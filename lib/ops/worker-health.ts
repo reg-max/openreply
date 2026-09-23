@@ -1,8 +1,20 @@
-import { getRedisConnection } from "@/lib/queue/client";
+/**
+ * Health and alerts for the DM pipeline.
+ *
+ * In this fork there is no long-lived worker: the heartbeat is written by the
+ * cron sweep (/api/cron/sweep) each time it runs, and stored in Postgres rather
+ * than Redis. The TTL is therefore sized for a sweep cadence of a few minutes,
+ * not for a 30-second worker heartbeat.
+ */
+
+import { kvGetJson, kvPushCapped, kvReadList, kvSetJson } from "@/lib/kv/pg-kv";
 
 const WORKER_HEALTH_KEY = "health:worker:dm";
 const WORKER_ALERTS_KEY = "alerts:worker:dm";
-const WORKER_HEARTBEAT_TTL_SECONDS = 120;
+// A sweep runs every ~10 minutes, so allow two missed runs plus slack before
+// calling the pipeline unhealthy.
+const WORKER_HEARTBEAT_TTL_SECONDS = 30 * 60;
+const WORKER_ALERTS_CAP = 25;
 
 export interface WorkerHeartbeat {
   status: "running";
@@ -28,15 +40,6 @@ export interface WorkerAlert {
   createdAt: string;
 }
 
-function parseJson<T>(value: string | null): T | null {
-  if (!value) return null;
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return null;
-  }
-}
-
 export async function recordWorkerHeartbeat(
   heartbeat: Omit<WorkerHeartbeat, "checkedAt" | "status" | "worker">
 ) {
@@ -47,18 +50,11 @@ export async function recordWorkerHeartbeat(
     checkedAt: new Date().toISOString(),
   };
 
-  await getRedisConnection().set(
-    WORKER_HEALTH_KEY,
-    JSON.stringify(payload),
-    "EX",
-    WORKER_HEARTBEAT_TTL_SECONDS
-  );
+  await kvSetJson(WORKER_HEALTH_KEY, payload, WORKER_HEARTBEAT_TTL_SECONDS);
 }
 
 export async function getWorkerHealth(): Promise<WorkerHealth> {
-  const heartbeat = parseJson<WorkerHeartbeat>(
-    await getRedisConnection().get(WORKER_HEALTH_KEY)
-  );
+  const heartbeat = await kvGetJson<WorkerHeartbeat>(WORKER_HEALTH_KEY);
 
   if (!heartbeat) {
     return { healthy: false, heartbeat: null, ageMs: null };
@@ -78,19 +74,11 @@ export async function recordWorkerAlert(alert: Omit<WorkerAlert, "createdAt">) {
     createdAt: new Date().toISOString(),
   };
 
-  const redis = getRedisConnection();
-  await redis.lpush(WORKER_ALERTS_KEY, JSON.stringify(payload));
-  await redis.ltrim(WORKER_ALERTS_KEY, 0, 24);
+  await kvPushCapped(WORKER_ALERTS_KEY, payload, WORKER_ALERTS_CAP);
 }
 
 export async function getWorkerAlerts(limit = 10): Promise<WorkerAlert[]> {
-  const values = await getRedisConnection().lrange(
-    WORKER_ALERTS_KEY,
-    0,
-    Math.max(0, limit - 1)
-  );
-
-  return values
-    .map((value) => parseJson<WorkerAlert>(value))
-    .filter((value): value is WorkerAlert => Boolean(value));
+  return kvReadList<WorkerAlert>(WORKER_ALERTS_KEY, limit);
 }
+
+export { WORKER_HEARTBEAT_TTL_SECONDS };

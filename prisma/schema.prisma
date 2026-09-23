@@ -416,3 +416,31 @@ model PostbackDelivery {
   id String @id
   createdAt DateTime @default(now())
 }
+
+// ─── Serverless replacements for Redis ──────────────────────────────────────
+// This fork runs without Redis and without a long-lived worker. These two
+// tables replace what Redis provided: a TTL key-value store (rate-limit
+// counters, worker heartbeat, alerts) and a durable store for delayed jobs
+// that a cron sweep runs when they come due.
+
+model KvEntry {
+  key       String    @id
+  value     String
+  expiresAt DateTime?
+  updatedAt DateTime  @updatedAt
+
+  @@index([expiresAt])
+}
+
+model DeferredJob {
+  id         String   @id @default(cuid())
+  name       String
+  dedupeKey  String?  @unique
+  data       Json
+  runAt      DateTime
+  attempts   Int      @default(0)
+  lockedAt   DateTime?
+  createdAt  DateTime @default(now())
+
+  @@index([runAt])
+}
